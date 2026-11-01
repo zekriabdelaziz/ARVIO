@@ -1,0 +1,99 @@
+diff --git a/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AiSubtitleRenderersFactory.kt b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AiSubtitleRenderersFactory.kt
+index 9ee3bf3..3961959 100644
+--- a/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AiSubtitleRenderersFactory.kt
++++ b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AiSubtitleRenderersFactory.kt
+@@ -167,7 +167,10 @@ class AiSubtitleRenderersFactory(
+             .setAudioProcessors(arrayOf(capture))
+             .build()
+         // Sync by hearing: hears the decoded audio where its own look-ahead copy can't be decoded.
+-        return com.arflix.tv.ui.screens.player.audiosync.AudioSyncTaps.wrapAudioSink(sink)
++        val tapped = com.arflix.tv.ui.screens.player.audiosync.AudioSyncTaps.wrapAudioSink(sink)
++        // DTS is hidden from the platform renderer so FFmpeg decodes it to PCM (see DtsPcmPolicy).
++        // Dolby formats are untouched and keep decoding / passthrough exactly as before.
++        return DtsPassthroughBlockingSink(tapped)
+     }
+ 
+     override fun buildTextRenderers(
+diff --git a/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AudioDecoderFallback.kt b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AudioDecoderFallback.kt
+index a810f6a..a9df91b 100644
+--- a/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AudioDecoderFallback.kt
++++ b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/AudioDecoderFallback.kt
+@@ -31,6 +31,9 @@ internal class AudioDecoderFallback {
+ 
+     fun wrapSelector(delegate: MediaCodecSelector): MediaCodecSelector =
+         MediaCodecSelector { mimeType, requiresSecureDecoder, requiresTunnelingDecoder ->
++            // Some TVs list a DTS MediaCodec that cannot actually decode; hide it so the FFmpeg
++            // renderer is used instead (only when FFmpeg is really available).
++            if (DtsPcmPolicy.active && DtsPcmPolicy.isDts(mimeType)) return@MediaCodecSelector emptyList()
+             val infos = delegate.getDecoderInfos(mimeType, requiresSecureDecoder, requiresTunnelingDecoder)
+             if (blockedDecoders.isEmpty()) infos else infos.filterNot { it.name in blockedDecoders }
+         }
+diff --git a/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/DtsPcmPolicy.kt b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/DtsPcmPolicy.kt
+new file mode 100644
+index 0000000..a0fb256
+--- /dev/null
++++ b/app/src/main/kotlin/com/arflix/tv/ui/screens/player/engine/exoplayer/DtsPcmPolicy.kt
+@@ -0,0 +1,63 @@
++package com.arflix.tv.ui.screens.player.engine.exoplayer
++
++import androidx.media3.common.Format
++import androidx.media3.common.MimeTypes
++import androidx.media3.exoplayer.audio.AudioSink
++import androidx.media3.exoplayer.audio.ForwardingAudioSink
++
++/**
++ * Forces DTS / DTS-HD / DTS:X to be software-decoded to PCM by the bundled FFmpeg extension,
++ * while every other codec (Dolby AC-3, E-AC-3, Atmos, TrueHD, AAC...) keeps using the normal
++ * platform path (decoder or passthrough).
++ *
++ * Why this exists: some TVs (e.g. TCL P635) advertise DTS support to Android, or expose a stub
++ * DTS decoder / passthrough route, but cannot actually play it - the platform
++ * MediaCodecAudioRenderer claims the track first, so FFmpeg is never tried and DTS is silent.
++ * Hiding DTS from the platform renderer makes ExoPlayer fall through to FfmpegAudioRenderer.
++ *
++ * Only active when the FFmpeg extension is really present (sideload build); on a build without
++ * it, DTS behaviour is unchanged so devices with real DTS support are not broken.
++ */
++@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
++object DtsPcmPolicy {
++
++    /** Master switch. Set to false for an AV receiver that should receive DTS as bitstream. */
++    @Volatile
++    var decodeDtsToPcm: Boolean = true
++
++    private val ffmpegAvailable: Boolean by lazy {
++        runCatching {
++            Class.forName("androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer")
++            Class.forName("androidx.media3.decoder.ffmpeg.FfmpegLibrary")
++                .getMethod("isAvailable")
++                .invoke(null) as Boolean
++        }.getOrDefault(false)
++    }
++
++    val active: Boolean
++        get() = decodeDtsToPcm && ffmpegAvailable
++
++    fun isDts(mimeType: String?): Boolean =
++        mimeType != null && (
++            mimeType == MimeTypes.AUDIO_DTS ||
++                mimeType == MimeTypes.AUDIO_DTS_HD ||
++                mimeType == MimeTypes.AUDIO_DTS_EXPRESS ||
++                mimeType == MimeTypes.AUDIO_DTS_X
++            )
++}
++
++/** Reports DTS as "not supported" to the platform renderer so it never claims (or bitstreams) it. */
++@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
++internal class DtsPassthroughBlockingSink(sink: AudioSink) : ForwardingAudioSink(sink) {
++
++    override fun supportsFormat(format: Format): Boolean =
++        if (DtsPcmPolicy.active && DtsPcmPolicy.isDts(format.sampleMimeType)) false
++        else super.supportsFormat(format)
++
++    override fun getFormatSupport(format: Format): Int =
++        if (DtsPcmPolicy.active && DtsPcmPolicy.isDts(format.sampleMimeType)) {
++            AudioSink.SINK_FORMAT_UNSUPPORTED
++        } else {
++            super.getFormatSupport(format)
++        }
++}
